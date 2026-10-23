@@ -1,0 +1,99 @@
+name: Radar immo du matin
+
+on:
+  schedule:
+    - cron: "30 5 * * *"   # 7h30 heure d'été à Paris
+    - cron: "30 6 * * *"   # 7h30 heure d'hiver à Paris
+  workflow_dispatch:        # bouton « Run workflow » pour lancer à la main
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: radar
+  cancel-in-progress: false
+
+jobs:
+  radar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - name: Garder un seul passage par matin (été / hiver)
+        id: gate
+        run: |
+          OFFSET=$(TZ=Europe/Paris date +%z)
+          SCHED="${{ github.event.schedule }}"
+          if [ "${{ github.event_name }}" != "schedule" ] \
+             || { [ "$OFFSET" = "+0200" ] && [ "$SCHED" = "30 5 * * *" ]; } \
+             || { [ "$OFFSET" = "+0100" ] && [ "$SCHED" = "30 6 * * *" ]; }; then
+            echo "go=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "Passage en double (changement d'heure) : ignoré"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.gate.outputs.go == '1'
+
+      - uses: actions/setup-python@v5
+        if: steps.gate.outputs.go == '1'
+        with:
+          python-version: "3.12"
+
+      - name: Installer
+        if: steps.gate.outputs.go == '1'
+        run: pip install pillow
+
+      - name: Lire les alertes Leboncoin (Gmail)
+        if: steps.gate.outputs.go == '1'
+        continue-on-error: true
+        env:
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+        run: python leboncoin_alertes.py
+
+      - name: Scanner tous les sites et chiffrer
+        if: steps.gate.outputs.go == '1'
+        env:
+          RADAR_SITE: _site
+          PYTHONIOENCODING: utf8
+        run: |
+          mkdir -p _site/photos
+          python veille.py
+          cp web/index.html _site/index.html
+
+      - uses: actions/configure-pages@v5
+        if: steps.gate.outputs.go == '1'
+
+      - uses: actions/upload-pages-artifact@v3
+        if: steps.gate.outputs.go == '1'
+        with:
+          path: _site
+
+      - name: Publier l'appli
+        id: deploy
+        if: steps.gate.outputs.go == '1'
+        uses: actions/deploy-pages@v4
+
+      - name: Envoyer l'email du Top 10
+        if: steps.gate.outputs.go == '1'
+        env:
+          RADAR_SITE: _site
+          SITE_URL: ${{ steps.deploy.outputs.page_url }}
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+        run: python email_top10.py
+
+      - name: Mémoriser l'état (dates, historique des prix)
+        if: always() && steps.gate.outputs.go == '1'
+        run: |
+          git config user.name "radar-bot"
+          git config user.email "radar-bot@users.noreply.github.com"
+          git add etat.json publies.json leboncoin.json
+          git commit -m "Etat du radar $(date +%F)" || echo "Rien à mémoriser"
+          git push
